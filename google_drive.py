@@ -1,3 +1,17 @@
+"""
+Работа с Google Drive API v3 для публично расшаренных папок ("Доступно
+всем, у кого есть ссылка" — Viewer). Для такого доступа не нужен OAuth,
+достаточно одного API-ключа из Google Cloud Console.
+
+Как получить ключ:
+  1. console.cloud.google.com -> создать проект (если ещё нет)
+  2. APIs & Services -> Library -> найти "Google Drive API" -> Enable
+  3. APIs & Services -> Credentials -> Create Credentials -> API key
+  4. Скопировать ключ в .env как GOOGLE_API_KEY
+
+Если папка НЕ расшарена публично ("по ссылке") — эти запросы будут
+возвращать 404, как будто файла не существует, даже если он есть.
+"""
 import os
 
 import requests

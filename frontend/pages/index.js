@@ -30,10 +30,121 @@ function DiagonalArt() {
   );
 }
 
+// Сегодняшняя дата YYYY-MM-DD по времени браузера (toISOString дал бы UTC и
+// вечером мог показать вчерашний день).
+function todayLocalISO() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+// Подсказка под полем ссылки: что распозналось. В Strapi type и id всё равно
+// считает бэкенд (video_utils.py) — здесь только для наглядности.
+function detectVideo(raw) {
+  const text = (raw || "").trim();
+  if (!text) return null;
+  let u;
+  try { u = new URL(text.includes("://") ? text : `https://${text}`); } catch { return null; }
+  const host = u.hostname.toLowerCase().replace(/^www\./, "").replace(/^m\./, "");
+  const yt = /^[A-Za-z0-9_-]{11}$/;
+  if (["youtube.com", "music.youtube.com", "youtube-nocookie.com"].includes(host)) {
+    const v = u.searchParams.get("v");
+    if (v && yt.test(v)) return { type: "youtube", id: v };
+    const m = u.pathname.match(/^\/(?:shorts|embed|live|v)\/([A-Za-z0-9_-]{11})/);
+    return m ? { type: "youtube", id: m[1] } : null;
+  }
+  if (host === "youtu.be") {
+    const m = u.pathname.match(/^\/([A-Za-z0-9_-]{11})/);
+    return m ? { type: "youtube", id: m[1] } : null;
+  }
+  if (host === "rutube.ru") {
+    const m = u.pathname.match(/^\/(?:video(?:\/private)?|play\/embed)\/([0-9a-fA-F]{32})/);
+    return m ? { type: "rutube", id: m[1] } : null;
+  }
+  if (host === "vimeo.com" || host === "player.vimeo.com") {
+    const m = u.pathname.match(/\/(\d{6,})(?:\/|$)/);
+    return m ? { type: "vimeo", id: m[1] } : null;
+  }
+  return null;
+}
+
 function ProgressBar() {
   return (
     <div className="progress-bar">
       <div className="fill" />
+    </div>
+  );
+}
+
+// Свой выпадающий список вместо системного <select>: тот выглядит по-разному
+// в каждом браузере и не подхватывает наш дизайн. Закрывается по клику вне
+// списка и по Escape, варианты — обычные кнопки, поэтому работают с Tab/Enter.
+function SelectBox({ value, onChange, options, placeholder = "— не выбрано —" }) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef(null);
+
+  useEffect(() => {
+    function onPointerDown(e) {
+      if (rootRef.current && !rootRef.current.contains(e.target)) setOpen(false);
+    }
+    function onKeyDown(e) {
+      if (e.key === "Escape") setOpen(false);
+    }
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, []);
+
+  const selected = options.find((o) => o.value === value);
+
+  function choose(next) {
+    onChange(next);
+    setOpen(false);
+  }
+
+  return (
+    <div className="select" ref={rootRef}>
+      <button
+        type="button"
+        className={`select-trigger${open ? " open" : ""}`}
+        onClick={() => setOpen((v) => !v)}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+      >
+        <span className={selected ? "" : "placeholder"}>{selected ? selected.label : placeholder}</span>
+        <svg className="chevron" width="12" height="8" viewBox="0 0 12 8" aria-hidden="true">
+          <path d="M1 1.5l5 5 5-5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </button>
+
+      {open && (
+        <ul className="select-menu" role="listbox">
+          <li>
+            <button type="button" role="option" aria-selected={!selected} className="select-option muted" onClick={() => choose("")}>
+              {placeholder}
+            </button>
+          </li>
+          {options.map((o) => (
+            <li key={o.value}>
+              <button
+                type="button" role="option" aria-selected={o.value === value}
+                className={`select-option${o.value === value ? " selected" : ""}`}
+                onClick={() => choose(o.value)}
+              >
+                <span>{o.label}</span>
+                {o.value === value && (
+                  <svg width="14" height="11" viewBox="0 0 14 11" aria-hidden="true">
+                    <path d="M1.5 5.5l3.5 3.5 7.5-7.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                )}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
@@ -63,13 +174,20 @@ export default function Home() {
 
   const [title, setTitle] = useState("");
   const [slug, setSlug] = useState("");
-  const [seoTitle, setSeoTitle] = useState("");
+  const [videoOn, setVideoOn] = useState(false);
+  const [videoUrl, setVideoUrl] = useState("");
+  const [videoField, setVideoField] = useState("bottomVideo"); // куда в Strapi класть видео
+  const [videoTitle, setVideoTitle] = useState("");
+  const [slugLoading, setSlugLoading] = useState(false);
+  const [slugError, setSlugError] = useState("");
   const [metaDescription, setMetaDescription] = useState("");
   const [keywords, setKeywords] = useState([]);
   const [keywordInput, setKeywordInput] = useState("");
   const [contentMd, setContentMd] = useState("");
   const [collection, setCollection] = useState("blogs");
   const [publishNow, setPublishNow] = useState(false);
+  const [scheduleOn, setScheduleOn] = useState(false);
+  const [scheduleAt, setScheduleAt] = useState(""); // значение <input type="datetime-local">, локальное время браузера
   const [categories, setCategories] = useState([]);
   const [categoryId, setCategoryId] = useState("");
   const [imagesFound, setImagesFound] = useState(0);
@@ -246,14 +364,19 @@ export default function Home() {
   }
 
   function applyParsedData(data) {
-    setTitle(data.title);
+    // Название в Strapi и SEO-title — одно и то же значение, поле одно
+    setTitle(data.seo_title || data.title);
     setSlug(data.slug);
-    setSeoTitle(data.seo_title);
     setMetaDescription(data.meta_description);
     setKeywords(data.keywords || []);
     setContentMd(data.content_md);
     setCollection(data.collection || "blogs");
     setPublishNow(!!data.publish_now);
+    setScheduleOn(false);
+    setScheduleAt("");
+    setVideoOn(false);
+    setVideoUrl("");
+    setVideoTitle("");
     setImagesFound(data.images_found || 0);
     setImageStatus(data.image_status || []);
     setFirstImageToken(data.first_image_token || null);
@@ -318,7 +441,7 @@ export default function Home() {
     setGenerating(true);
     setPreviewError("");
     try {
-      const body = { title: seoTitle || title, subject };
+      const body = { title, subject };
       if (coverSource === "upload" && coverUploadBase64) {
         body.source_image_base64 = coverUploadBase64;
       } else if (coverSource === "first_article_image" && firstImageToken) {
@@ -341,19 +464,76 @@ export default function Home() {
     }
   }
 
+  async function handleRegenerateSlug() {
+    setSlugError("");
+    setSlugLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/slug`, {
+        method: "POST",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ title }),
+      });
+      if (res.status === 401) { handleAuthFailure(); return; }
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `Сервер вернул ${res.status}`);
+      setSlug(data.slug);
+    } catch (e) {
+      setSlugError(e.message);
+    } finally {
+      setSlugLoading(false);
+    }
+  }
+
   async function handlePublish() {
+    setPublishResult(null);
+    // В Strapi черновик сохраняется и без обязательных полей, а при
+    // публикации они проверяются. "Превью" там обязательное — без него
+    // "опубликовать сразу" гарантированно вернёт 400.
+    if ((publishNow || scheduleOn) && !previewToken) {
+      setPublishError(
+        "Чтобы опубликовать сразу или отложенно, нужна превью-картинка — в Strapi это поле обязательное. " +
+        "Сгенерируйте превью выше или снимите галочку и сохраните статью как черновик."
+      );
+      return;
+    }
+    if (videoOn) {
+      if (!detectVideo(videoUrl)) {
+        setPublishError("Не удалось распознать ссылку на видео. Поддерживаются YouTube, Rutube и Vimeo.");
+        return;
+      }
+      if (!videoTitle.trim()) {
+        setPublishError("Укажите название видео — в Strapi это обязательное поле.");
+        return;
+      }
+    }
+    let publishAt = null;
+    if (scheduleOn) {
+      // datetime-local без пояса — трактуем как локальное время браузера и отправляем в UTC
+      const moment = new Date(scheduleAt);
+      if (!scheduleAt || isNaN(moment.getTime())) {
+        setPublishError("Укажите дату и время отложенной публикации.");
+        return;
+      }
+      if (moment.getTime() <= Date.now()) {
+        setPublishError("Время отложенной публикации должно быть в будущем.");
+        return;
+      }
+      publishAt = moment.toISOString();
+    }
     setPublishing(true);
     setPublishError("");
-    setPublishResult(null);
     try {
       const res = await fetch(`${API_BASE}/api/publish`, {
         method: "POST",
         headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({
-          title, content_md: contentMd, slug, seo_title: seoTitle,
+          title, content_md: contentMd, slug, seo_title: title,
           meta_description: metaDescription, keywords, collection, publish_now: publishNow,
+          publish_at: publishAt,
+          video_url: videoOn ? videoUrl : null, video_title: videoOn ? videoTitle : "", video_field: videoField,
           cover_token: previewToken,
           category_id: categoryId || null,
+          date: todayLocalISO(),
         }),
       });
       if (res.status === 401) { handleAuthFailure(); return; }
@@ -409,9 +589,9 @@ export default function Home() {
               <div className="eyebrow">ЭВОЛЮЦИЯ · автоматизация публикаций</div>
               <h1>От документа в Google Диске до сайта — без ручной сборки</h1>
               <p>
-                Выберите статью в общей таблице редакции — заголовок, картинки
-                из документа и SEO-поля разложатся по нужным местам и уйдут
-                на сайт одним нажатием.
+                Выберите статью в папке на Google Диске (или загрузите .docx
+                с компьютера) — заголовок, картинки из документа и SEO-поля
+                разложатся по нужным местам и уйдут на сайт одним нажатием.
               </p>
             </div>
             <div className="hero-art"><DiagonalArt /></div>
@@ -531,7 +711,7 @@ export default function Home() {
               <div className="panel">
                 <div className="panel-label">Статья</div>
                 <div className="field">
-                  <label>Заголовок</label>
+                  <label>Название / SEO-title</label>
                   <input type="text" value={title} onChange={(e) => setTitle(e.target.value)} />
                 </div>
                 <div className="field">
@@ -539,7 +719,17 @@ export default function Home() {
                   <div className="slug-input">
                     <span className="slug-prefix">/</span>
                     <input className="mono" type="text" value={slug} onChange={(e) => setSlug(e.target.value)} />
+                    <button
+                      type="button"
+                      className="btn slug-regen"
+                      disabled={slugLoading || !title}
+                      onClick={handleRegenerateSlug}
+                      title="Сгенерировать заново из названия, с проверкой что такого slug ещё нет в Strapi"
+                    >
+                      {slugLoading ? "…" : "↻"}
+                    </button>
                   </div>
+                  {slugError && <div className="status error">{slugError}</div>}
                 </div>
                 <div className="hint" style={{ marginTop: 0 }}>
                   Картинок найдено в документе: {imagesFound}
@@ -577,10 +767,6 @@ export default function Home() {
             <div>
               <div className="panel">
                 <div className="panel-label">SEO</div>
-                <div className="field">
-                  <label>SEO-title</label>
-                  <input type="text" value={seoTitle} onChange={(e) => setSeoTitle(e.target.value)} />
-                </div>
                 <div className="field">
                   <label>Meta description</label>
                   <textarea rows={3} value={metaDescription} onChange={(e) => setMetaDescription(e.target.value)} />
@@ -652,17 +838,72 @@ export default function Home() {
                 <div className="panel-label">Публикация</div>
                 <div className="field">
                   <label>Категория</label>
-                  <select value={categoryId} onChange={(e) => setCategoryId(e.target.value)}>
-                    <option value="">Без категории</option>
-                    {categories.map((c) => (
-                      <option key={c.document_id} value={c.document_id}>{c.title || `#${c.document_id}`}</option>
-                    ))}
-                  </select>
+                  <SelectBox
+                    value={categoryId}
+                    onChange={setCategoryId}
+                    options={categories.map((c) => ({ value: c.document_id, label: c.title || `#${c.document_id}` }))}
+                    placeholder="Без категории"
+                  />
                 </div>
                 <label className="checkbox-row">
-                  <input type="checkbox" checked={publishNow} onChange={(e) => setPublishNow(e.target.checked)} />
+                  <input type="checkbox" checked={videoOn} onChange={(e) => setVideoOn(e.target.checked)} />
+                  В статье есть видео
+                </label>
+                {videoOn && (
+                  <div className="schedule-box">
+                    <label>Поле в Strapi</label>
+                    <div style={{ display: "flex", gap: 20, marginBottom: 14 }}>
+                      {["video", "bottomVideo"].map((f) => (
+                        <label key={f} className="checkbox-row" style={{ margin: 0 }}>
+                          <input type="radio" name="video-field" checked={videoField === f} onChange={() => setVideoField(f)} />
+                          {f}
+                        </label>
+                      ))}
+                    </div>
+                    <label>Ссылка на видео (YouTube, Rutube или Vimeo)</label>
+                    <input
+                      type="text"
+                      placeholder="https://www.youtube.com/watch?v=…"
+                      value={videoUrl}
+                      onChange={(e) => setVideoUrl(e.target.value)}
+                    />
+                    {videoUrl.trim() && (
+                      <div className="hint">
+                        {detectVideo(videoUrl)
+                          ? `Распознано: ${detectVideo(videoUrl).type} · id ${detectVideo(videoUrl).id}`
+                          : "Ссылка не распознана"}
+                      </div>
+                    )}
+                    <label style={{ marginTop: 12 }}>Название видео</label>
+                    <input type="text" value={videoTitle} onChange={(e) => setVideoTitle(e.target.value)} />
+                  </div>
+                )}
+                <label className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={publishNow}
+                    onChange={(e) => { setPublishNow(e.target.checked); if (e.target.checked) setScheduleOn(false); }}
+                  />
                   Опубликовать сразу (иначе — черновик)
                 </label>
+                <label className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={scheduleOn}
+                    onChange={(e) => { setScheduleOn(e.target.checked); if (e.target.checked) setPublishNow(false); }}
+                  />
+                  Отложить публикацию
+                </label>
+                {scheduleOn && (
+                  <div className="schedule-box">
+                    <label>Дата и время публикации (местное время)</label>
+                    <input
+                      type="datetime-local"
+                      value={scheduleAt}
+                      onChange={(e) => setScheduleAt(e.target.value)}
+                    />
+                  </div>
+                )}
                 <div className="actions">
                   <button className="btn btn-primary" disabled={!canPublish} onClick={handlePublish}>
                     {publishing ? "Публикую…" : "Опубликовать"}
@@ -676,11 +917,17 @@ export default function Home() {
                 {publishResult && (
                   <div className="status success">
                     Готово · id {publishResult.data?.id ?? "—"} · documentId {publishResult.data?.documentId ?? "—"}
+                    {publishResult.scheduled_at &&
+                      ` · опубликуется ${new Date(publishResult.scheduled_at).toLocaleString("ru-RU")}`}
+                  </div>
+                )}
+                {publishResult?.schedule_error && (
+                  <div className="status error">
+                    Черновик создан, но запланировать публикацию не удалось: {publishResult.schedule_error}
                   </div>
                 )}
                 <div className="hint">
                   Картинки внутри статьи грузятся в Strapi Media Library прямо при публикации.
-                  Не забудьте потом проставить ссылку в колонке "Ссылка на сайте" в таблице редакции.
                 </div>
               </div>
             </div>
@@ -689,4 +936,4 @@ export default function Home() {
       </div>
     </>
   );
-}
+}

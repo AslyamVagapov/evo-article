@@ -1,3 +1,4 @@
+"""Транслитерация кириллицы в slug (kebab-case), общая для docx_parser и strapi_client."""
 import re
 
 _TRANSLIT_MAP = {

@@ -1,12 +1,64 @@
+"""
+Клиент для публикации статьи в Strapi 5.
+
+Схема подобрана по реальному ответу API твоей коллекции "Блог - Статьи"
+(api::blog.blog, REST-эндпоинт /api/blogs):
+
+  {
+    "title": "...",
+    "slug": "...",                  # обязательное поле (UID), уникальное
+    "body": "...markdown...",       # тело статьи (НЕ "content"!)
+    "metadata": {                   # вложенный компонент, не relation
+      "title": "...",               # SEO-title
+      "description": "...",         # meta description
+      "keywords": "раз, два, три",  # СТРОКА через запятую, не массив!
+      "robots": "index, follow"
+    }
+  }
+
+Если схема у тебя всё же отличается (например REST-имя коллекции не
+"blogs", или что-то переименовали) — поправь COLLECTION_DEFAULT и
+структуру _build_payload() ниже.
+"""
 import os
+from datetime import date as _date
+
 import requests
+
 from slug_utils import slugify_ru
 
 COLLECTION_DEFAULT = "blogs"  # REST-имя коллекции; проверь запросом
                                # GET {STRAPI_URL}/api/blogs?pagination[limit]=1
                                # если 404 — попробуй "blog" или другое имя
+CATEGORY_COLLECTION_DEFAULT = "blog-categories"  # REST-имя коллекции категорий;
+                               # проверь так же — если 404, попробуй "blog-category"
 
 DEFAULT_ROBOTS = "index, follow"
+
+
+def _raise_for_strapi_error(response) -> None:
+    """Как response.raise_for_status(), но с настоящим текстом ошибки от
+    Strapi. Стандартный вариант пишет только "400 Bad Request for url",
+    а причина (какое именно поле не прошло проверку) лежит в теле ответа:
+    {"error": {"message": "...", "details": {"errors": [{"path": [...], "message": "..."}]}}}
+    """
+    if response.ok:
+        return
+    message = ""
+    try:
+        error = response.json().get("error", {})
+        message = error.get("message", "")
+        details = error.get("details")
+        errors = details.get("errors") if isinstance(details, dict) else None
+        if errors:
+            parts = [
+                f"{'.'.join(str(p) for p in e.get('path', []))}: {e.get('message', '')}".strip(": ")
+                for e in errors
+            ]
+            message = f"{message} — {'; '.join(parts)}" if message else "; ".join(parts)
+    except ValueError:
+        message = response.text[:300]
+    raise RuntimeError(f"Strapi вернул {response.status_code}: {message or response.reason}")
 
 
 class StrapiClient:
@@ -30,7 +82,7 @@ class StrapiClient:
             headers=self._headers(),
             timeout=60,
         )
-        response.raise_for_status()
+        _raise_for_strapi_error(response)
         return response.json()[0]
 
     def upload_file(self, file_obj, filename: str = "image.png", mime: str = "image/png") -> int:
@@ -43,7 +95,7 @@ class StrapiClient:
         url = item["url"]
         return url if url.startswith("http") else f"{self.base_url}{url}"
 
-    def list_categories(self, collection: str = "blog-categories") -> list[dict]:
+    def list_categories(self, collection: str = CATEGORY_COLLECTION_DEFAULT) -> list[dict]:
         """Возвращает список категорий блога (documentId + title) для
         выпадающего списка в интерфейсе. Поддерживает и Strapi v4
         (data[].attributes.title, только числовой id), и v5 (title лежит
@@ -62,7 +114,7 @@ class StrapiClient:
             params={"pagination[limit]": 200, "sort": "title:asc"},
             timeout=15,
         )
-        response.raise_for_status()
+        _raise_for_strapi_error(response)
         items = response.json().get("data", [])
         result = []
         for item in items:
@@ -84,9 +136,13 @@ class StrapiClient:
         meta_description: str = "",
         keywords: list[str] | None = None,
         cover_id: int | None = None,
+        category_id: str | None = None,  # это document_id категории, не числовой id
+        date: str | None = None,          # обязательное поле Strapi "date", формат YYYY-MM-DD
         collection: str = COLLECTION_DEFAULT,
         extra_fields: dict | None = None,
         publish: bool = False,
+        video: dict | None = None,        # {"title": ..., "type": "youtube|rutube|vimeo", "value": "<id>"}
+        video_field: str = "bottomVideo", # в какое поле Strapi класть видео: "video" или "bottomVideo"
     ) -> dict:
         data = {
             "title": title,
@@ -102,6 +158,14 @@ class StrapiClient:
         }
         if cover_id is not None:
             data["img"] = cover_id  # поле обложки — верхнего уровня, не внутри metadata
+        if category_id is not None:
+            data["category"] = category_id
+        if video:
+            data[video_field] = video  # одиночный компонент (не repeatable) — объект, не список
+        # Поле date в Strapi обязательное: черновик сохранится и без него, а вот
+        # публикация (в том числе позже, из админки) упадёт с "date must be defined".
+        # Поэтому отправляем всегда; если дату не передали — берём сегодняшнюю.
+        data["date"] = date or _date.today().isoformat()
 
         if extra_fields:
             data.update(extra_fields)
@@ -115,5 +179,61 @@ class StrapiClient:
             params=params,
             timeout=30,
         )
-        response.raise_for_status()
+        _raise_for_strapi_error(response)
+        return response.json()
+
+    def unique_slug(self, title: str, collection: str = COLLECTION_DEFAULT) -> str:
+        """Slug из названия, которого ещё нет в Strapi: при совпадении добавляет
+        -2, -3 и т.д. status=draft нужен, чтобы увидеть и неопубликованные
+        статьи — в Strapi 5 без него REST отдаёт только опубликованные."""
+        base = slugify_ru(title) or "article"
+        response = requests.get(
+            f"{self.base_url}/api/{collection}",
+            headers=self._headers(),
+            params={
+                "filters[slug][$startsWith]": base,
+                "status": "draft",
+                "fields[0]": "slug",
+                "pagination[pageSize]": 100,
+            },
+            timeout=15,
+        )
+        _raise_for_strapi_error(response)
+        taken = {
+            item.get("slug") or item.get("attributes", {}).get("slug", "")
+            for item in response.json().get("data", [])
+        }
+        if base not in taken:
+            return base
+        n = 2
+        while f"{base}-{n}" in taken:
+            n += 1
+        return f"{base}-{n}"
+
+    def schedule_publish(
+        self,
+        document_id: str,
+        execute_at: str,  # ISO 8601 в UTC, например 2026-10-09T19:00:00.000Z
+        entity_slug: str | None = None,
+    ) -> dict:
+        """Планирует публикацию черновика через плагин Publisher: время
+        срабатывания хранит и отслеживает сам Strapi, наш бэкенд после этого
+        не нужен. Маршрут публичный (/api/publisher/actions), авторизация —
+        обычный API-токен; у токена должны быть права Publisher → create.
+        entityId здесь — documentId статьи, а не числовой id."""
+        response = requests.post(
+            f"{self.base_url}/api/publisher/actions",
+            json={
+                "data": {
+                    "mode": "publish",
+                    "entityId": document_id,
+                    "entitySlug": entity_slug or os.getenv("STRAPI_ENTITY_SLUG", "api::blog.blog"),
+                    "executeAt": execute_at,
+                    "locale": None,
+                }
+            },
+            headers=self._headers(),
+            timeout=30,
+        )
+        _raise_for_strapi_error(response)
         return response.json()

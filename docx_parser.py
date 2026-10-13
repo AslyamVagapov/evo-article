@@ -24,6 +24,19 @@ TRAILING_HARD_BREAK_RE = re.compile(r"\\[ \t]*$", re.MULTILINE)
 # дальше блок обрабатывается как обычные абзацы, независимо от того,
 # каким стилем он был оформлен в Word.
 BLOCKQUOTE_MARKER_RE = re.compile(r"^>+[ \t]?", re.MULTILINE)
+_FIRST_H1_RE = re.compile(r"^#[ \t]+\S", re.MULTILINE)
+
+
+def _unwrap_service_block_quote(raw: str) -> str:
+    """Снимает маркеры цитаты со служебного блока — но только до первого
+    заголовка H1, чтобы не трогать настоящие цитаты внутри самой статьи.
+    Если H1 в документе нет (заголовок определяется позже по абзацу),
+    границу служебного блока не угадать — снимаем маркеры во всём тексте."""
+    h1 = _FIRST_H1_RE.search(raw)
+    if not h1:
+        return BLOCKQUOTE_MARKER_RE.sub("", raw)
+    head, tail = raw[: h1.start()], raw[h1.start():]
+    return BLOCKQUOTE_MARKER_RE.sub("", head) + tail
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 
@@ -39,7 +52,7 @@ def _normalize_raw_markdown(raw: str) -> str:
     raw = SETEXT_H1_RE.sub(lambda m: f"# {m.group(1).strip()}", raw)
     raw = SETEXT_H2_RE.sub(lambda m: f"## {m.group(1).strip()}", raw)
     raw = TRAILING_HARD_BREAK_RE.sub("", raw)
-    raw = BLOCKQUOTE_MARKER_RE.sub("", raw)
+    raw = _unwrap_service_block_quote(raw)
     raw = _fix_empty_table_headers(raw)
     return raw
 
@@ -762,7 +775,7 @@ def parse_article(docx_path: str, media_dir: Path, known_title: str = "") -> Par
     # заголовок должен присутствовать в самом теле статьи (от названия
     # включительно до FAQ включительно), поэтому возвращаем его обратно
     # первой строкой — независимо от того, пришёл ли он из документа
-    # или был передан снаружи (known_title, например из таблицы Google Диска)
+    # или был передан снаружи (known_title)
     if title:
         body = f"# {title}\n\n{body.lstrip()}"
 

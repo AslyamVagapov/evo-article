@@ -1,5 +1,4 @@
 import base64
-import datetime
 import io
 import mimetypes
 import os
@@ -7,6 +6,7 @@ import re
 import secrets
 import shutil
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -18,7 +18,9 @@ from pydantic import BaseModel
 from docx_parser import ParsedArticle, parse_article, replace_image_placeholders
 from google_drive import GoogleDriveError, download_docx_bytes, list_children
 from image_gen import ImageGenError, generate_preview
+from slug_utils import slugify_ru
 from strapi_client import StrapiClient
+from video_utils import parse_video_url
 from yandex_disk import YandexDiskError, download_image_bytes
 
 load_dotenv()
@@ -47,9 +49,50 @@ def require_auth(x_app_password: str = Header(default="")):
         raise HTTPException(status_code=401, detail="Неверный пароль доступа")
 
 
-# In-memory хранилище картинок: token -> (байты, mime). См. article-demo —
-# тот же приём, чтобы не гонять base64 через JSON туда-обратно.
-_IMAGE_STORE: dict[str, tuple[bytes, str]] = {}
+# Картинки между шагами (парсинг -> генерация превью -> публикация)
+# хранятся на диске, а не в памяти процесса: так они переживают
+# перезапуск сервера (деплой новой версии, падение, systemd-рестарт)
+# и не копятся бесконечно в оперативной памяти. Файл называется
+# <token>.<расширение>, само расширение подсказывает mime-тип при чтении.
+# Так JSON-ответ остаётся маленьким — вместо гигантской base64-строки
+# внутри markdown там просто короткая ссылка вида /api/image/<token>.
+IMAGE_STORE_DIR = Path(__file__).parent / "image_store"
+IMAGE_STORE_DIR.mkdir(exist_ok=True)
+
+
+def _store_image(data: bytes, mime: str) -> str:
+    token = secrets.token_hex(8)
+    ext = mimetypes.guess_extension(mime) or ".bin"
+    (IMAGE_STORE_DIR / f"{token}{ext}").write_bytes(data)
+    return token
+
+
+def _load_image(token: str) -> tuple[bytes, str] | None:
+    # token — случайный hex, но на всякий случай не даём выйти за пределы папки
+    if not re.fullmatch(r"[0-9a-f]+", token):
+        return None
+    matches = list(IMAGE_STORE_DIR.glob(f"{token}.*"))
+    if not matches:
+        return None
+    path = matches[0]
+    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    return path.read_bytes(), mime
+
+
+def _cleanup_old_images(max_age_hours: float = 48) -> None:
+    """Удаляет файлы старше max_age_hours — вызывается при старте сервера,
+    чтобы папка не росла бесконечно от незавершённых/забытых генераций."""
+    import time
+    cutoff = time.time() - max_age_hours * 3600
+    for path in IMAGE_STORE_DIR.glob("*"):
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            pass
+
+
+_cleanup_old_images()
 
 REFERENCE_PATH = Path(__file__).parent / "reference_images" / "preview.png"
 REFERENCE_PATH.parent.mkdir(exist_ok=True)
@@ -57,9 +100,9 @@ REFERENCE_PATH.parent.mkdir(exist_ok=True)
 
 @app.get("/api/image/{token}")
 def get_image(token: str):
-    item = _IMAGE_STORE.get(token)
+    item = _load_image(token)
     if not item:
-        raise HTTPException(status_code=404, detail="Картинка не найдена (или сервер перезапускался)")
+        raise HTTPException(status_code=404, detail="Картинка не найдена (или устарела и была удалена)")
     data, mime = item
     return Response(content=data, media_type=mime)
 
@@ -79,10 +122,7 @@ def auth_check():
 
 
 # ============== Шаг 1: источник статей — Google Диск ==============
-# Возврат к варианту с папками на Google Диске (как в article-demo) вместо
-# Google Таблицы — таблица оказалась ненадёжным звеном (легко сломать
-# структуру листа руками), с папками такого риска нет: редакция просто
-# кладёт .docx в нужную папку.
+# Редакция кладёт .docx (или Google Docs) в папку на Google Диске.
 
 @app.get("/api/drive/list", dependencies=[Depends(require_auth)])
 def api_drive_list(folder_id: str | None = None):
@@ -102,11 +142,11 @@ def api_drive_list(folder_id: str | None = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ============== Шаг 2: парсинг .docx (общий код для обоих источников) ======
+# ============== Шаг 2: парсинг .docx (с компьютера или с Google Диска) ======
 
 def _process_parsed_article(article: ParsedArticle) -> dict:
     """Общий хвост пайплайна после docx_parser.parse_article: картинки —
-    в _IMAGE_STORE, финальная форма ответа (та же самая форма ожидает и
+    в image_store/, финальная форма ответа (та же самая форма ожидает и
     /api/publish). SEO-поля берутся ровно такими, какими их распознал
     docx_parser из служебного блока в документе — никакой генерации через
     нейросеть здесь нет, если блока нет или он неполный, поля просто
@@ -119,8 +159,7 @@ def _process_parsed_article(article: ParsedArticle) -> dict:
     image_status: list[dict] = []
     for img in article.images:
         if img.data is not None:
-            token = secrets.token_hex(8)
-            _IMAGE_STORE[token] = (img.data, img.mime)
+            token = _store_image(img.data, img.mime)
             preview_url = f"/api/image/{token}"
             image_srcs.append(preview_url)
             image_status.append({"url": None, "status": "ok", "preview_url": preview_url})
@@ -130,8 +169,7 @@ def _process_parsed_article(article: ParsedArticle) -> dict:
             try:
                 img_bytes = download_image_bytes(img.yandex_url)
                 mime = mimetypes.guess_type(img.yandex_url)[0] or "image/jpeg"
-                token = secrets.token_hex(8)
-                _IMAGE_STORE[token] = (img_bytes, mime)
+                token = _store_image(img_bytes, mime)
                 preview_url = f"/api/image/{token}"
                 image_srcs.append(preview_url)
                 image_status.append({"url": img.yandex_url, "status": "ok", "preview_url": preview_url})
@@ -242,7 +280,7 @@ def api_generate_preview(req: GeneratePreviewRequest):
         except Exception:
             raise HTTPException(status_code=400, detail="Некорректный base64 в source_image_base64")
     elif req.source_token:
-        item = _IMAGE_STORE.get(req.source_token)
+        item = _load_image(req.source_token)
         if item:
             source_bytes = item[0]
 
@@ -256,8 +294,7 @@ def api_generate_preview(req: GeneratePreviewRequest):
     except ImageGenError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    token = secrets.token_hex(8)
-    _IMAGE_STORE[token] = (preview_bytes, "image/png")
+    token = _store_image(preview_bytes, "image/png")
     return {"preview_token": token, "preview_url": f"/api/image/{token}"}
 
 
@@ -266,18 +303,33 @@ def api_generate_preview(req: GeneratePreviewRequest):
 LOCAL_IMAGE_TAG_RE = re.compile(r"!\[(.*?)\]\(/api/image/([a-f0-9]+)\)")
 
 
-def _upload_local_images_to_strapi(content_md: str, client: StrapiClient) -> str:
-    def _replace(match):
+def _upload_local_images_to_strapi(content_md: str, client: StrapiClient, name_prefix: str = "content-image") -> str:
+    """Находит все ![](/api/image/<token>) в тексте, грузит соответствующие
+    байты (сохранённые на шаге парсинга) в Strapi Media Library и заменяет
+    ссылку на постоянный url из Strapi. Файлы называются <name_prefix>-1,
+    <name_prefix>-2 ... в порядке появления в тексте."""
+    counter = 0
+
+    def _replace(match: re.Match) -> str:
         alt_text, token = match.group(1), match.group(2)
-        item = _IMAGE_STORE.get(token)
+        item = _load_image(token)
         if not item:
+            # картинка не найдена на диске (истёк срок хранения, 48ч)
+            # — оставляем как есть, чтобы не потерять место
             return match.group(0)
+        nonlocal counter
+        counter += 1
         data, mime = item
-        ext = (mime.split("/")[-1] or "jpg").split("+")[0]
-        url = client.upload_file_url(io.BytesIO(data), filename=f"content-image.{ext}", mime=mime)
+        ext = (mime.split("/")[-1] or "jpg").split("+")[0]  # image/svg+xml -> svg
+        url = client.upload_file_url(
+            io.BytesIO(data), filename=f"{name_prefix}-{counter}.{ext}", mime=mime
+        )
         return f"![{alt_text}]({url})"
 
     return LOCAL_IMAGE_TAG_RE.sub(_replace, content_md)
+
+
+VIDEO_FIELDS = ("video", "bottomVideo")  # одинаковые по структуре компоненты в схеме статьи
 
 
 class PublishRequest(BaseModel):
@@ -298,6 +350,24 @@ class PublishRequest(BaseModel):
     # валидацию (черновик проходит: Strapi 5 проверяет required-поля
     # только при публикации). Если фронтенд не прислал — ставим сегодня.
     date: str | None = None
+    publish_at: str | None = None  # ISO 8601 с часовым поясом — отложенная публикация
+    video_url: str | None = None   # ссылка на YouTube / Rutube / Vimeo
+    video_title: str = ""          # поле "Название" компонента видео
+    video_field: str = "bottomVideo"  # в какое поле Strapi класть видео: video или bottomVideo
+
+
+def _parse_publish_at(value: str) -> str:
+    """Приводит publish_at к UTC ISO ('...Z') и проверяет, что момент в будущем."""
+    try:
+        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="publish_at должен быть датой в формате ISO 8601")
+    if moment.tzinfo is None:
+        raise HTTPException(status_code=400, detail="publish_at должен содержать часовой пояс")
+    moment = moment.astimezone(timezone.utc)
+    if moment <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="Время отложенной публикации уже прошло")
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
 @app.get("/api/categories", dependencies=[Depends(require_auth)])
@@ -313,23 +383,66 @@ def api_categories():
         return {"categories": [], "error": str(e)}
 
 
+class SlugRequest(BaseModel):
+    title: str
+
+
+@app.post("/api/slug", dependencies=[Depends(require_auth)])
+def api_slug(req: SlugRequest):
+    """Новый slug из названия, уникальный среди статей в Strapi (черновики тоже учитываются)."""
+    if not req.title.strip():
+        raise HTTPException(status_code=400, detail="Сначала заполните заголовок")
+    try:
+        return {"slug": StrapiClient().unique_slug(req.title)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/publish", dependencies=[Depends(require_auth)])
 def api_publish(req: PublishRequest):
+    """
+    Публикует статью в Strapi:
+      1) находит в content_md ссылки на наши локальные /api/image/<token>,
+         грузит соответствующие картинки в Strapi Media Library и
+         подставляет вместо них постоянные url
+      2) если передан cover_token — грузит эту картинку отдельно и
+         подставляет как обложку (поле "img")
+      3) создаёт запись в коллекции с полями title/slug/body/metadata
+         (metadata.title/description/keywords — см. strapi_client.py),
+         category — если передан category_id
+      4) если передан publish_at — планирует публикацию черновика через
+         плагин Publisher
+    """
+    execute_at = _parse_publish_at(req.publish_at) if req.publish_at else None
+    if execute_at and req.publish_now:
+        raise HTTPException(status_code=400, detail="Нельзя одновременно публиковать сразу и отложенно")
+    video = None
+    if req.video_url and req.video_url.strip():
+        if req.video_field not in VIDEO_FIELDS:
+            raise HTTPException(status_code=400, detail=f"video_field должен быть одним из: {VIDEO_FIELDS}")
+        parsed_video = parse_video_url(req.video_url)
+        if not parsed_video:
+            raise HTTPException(
+                status_code=400,
+                detail="Не удалось распознать ссылку на видео. Поддерживаются YouTube, Rutube и Vimeo.",
+            )
+        if not req.video_title.strip():
+            raise HTTPException(status_code=400, detail="Укажите название видео — в Strapi это обязательное поле")
+        video = {"title": req.video_title.strip(), "type": parsed_video[0], "value": parsed_video[1]}
     try:
         client = StrapiClient()
-        final_body = _upload_local_images_to_strapi(req.content_md, client)
+        # Папки Media Library недоступны через Content API, поэтому файлы
+        # группируем именем: <slug>-cover.png, <slug>-1.jpg ... — их легко найти
+        # поиском в "API Uploads".
+        file_prefix = (req.slug or slugify_ru(req.title) or "article")[:80].strip("-")
+        final_body = _upload_local_images_to_strapi(req.content_md, client, name_prefix=file_prefix)
 
         cover_id = None
         if req.cover_token:
-            item = _IMAGE_STORE.get(req.cover_token)
+            item = _load_image(req.cover_token)
             if item:
                 data, mime = item
-                cover_id = client.upload_file(io.BytesIO(data), filename="cover.png", mime=mime)
-
-        extra_fields = {"category": req.category_id} if req.category_id else {}
-        date_field = os.getenv("STRAPI_DATE_FIELD", "date")
-        if date_field:
-            extra_fields[date_field] = req.date or datetime.date.today().isoformat()
+                cover_id = client.upload_file(io.BytesIO(data), filename=f"{file_prefix}-cover.png", mime=mime)
 
         result = client.create_article(
             title=req.title,
@@ -339,10 +452,21 @@ def api_publish(req: PublishRequest):
             meta_description=req.meta_description,
             keywords=req.keywords,
             cover_id=cover_id,
+            category_id=req.category_id,
+            date=req.date,
             collection=req.collection,
-            extra_fields=extra_fields,
             publish=req.publish_now,
+            video=video,
+            video_field=req.video_field,
         )
+        if execute_at:
+            # Черновик уже создан — если планирование не удалось, не отдаём 500
+            # (повторная отправка создала бы дубль), а возвращаем ошибку рядом с результатом.
+            try:
+                client.schedule_publish(result["data"]["documentId"], execute_at)
+                result["scheduled_at"] = execute_at
+            except Exception as e:
+                result["schedule_error"] = str(e)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
