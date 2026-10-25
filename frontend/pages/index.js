@@ -68,6 +68,24 @@ function detectVideo(raw) {
   return null;
 }
 
+// Отрисованный markdown статьи — один и тот же и в компактном предпросмотре,
+// и в полноэкранном режиме.
+function MarkdownPreview({ content, className = "" }) {
+  return (
+    <div className={`markdown-preview${className ? ` ${className}` : ""}`}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          img: ({ src, alt }) => <img src={src?.startsWith("/api/") ? `${API_BASE}${src}` : src} alt={alt} />,
+          table: ({ children }) => <div className="table-scroll"><table>{children}</table></div>,
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
 function ProgressBar() {
   return (
     <div className="progress-bar">
@@ -194,6 +212,20 @@ export default function Home() {
   const [imageStatus, setImageStatus] = useState([]);
 
   const [editorTab, setEditorTab] = useState("write");
+  const [previewFull, setPreviewFull] = useState(false);
+
+  useEffect(() => {
+    // полноэкранный предпросмотр: закрытие по Esc, фон страницы не прокручивается
+    if (!previewFull) return;
+    const onKey = (e) => { if (e.key === "Escape") setPreviewFull(false); };
+    document.addEventListener("keydown", onKey);
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.body.style.overflow = prevOverflow;
+    };
+  }, [previewFull]);
 
   const [publishing, setPublishing] = useState(false);
   const [publishResult, setPublishResult] = useState(null);
@@ -385,6 +417,9 @@ export default function Home() {
     setCoverUploadPreview(null);
     setPreviewToken(null);
     setPreviewUrl(null);
+    setPreviewError("");
+    setSubject("");        // "Что на фото" относилось к прошлой статье
+    setKeywordInput("");
     setPublishResult(null);
     setPublishError("");
     setParsed(true);
@@ -571,6 +606,20 @@ export default function Home() {
         </div>
       )}
 
+      {previewFull && (
+        <div className="fullscreen-overlay" role="dialog" aria-modal="true" aria-label="Предпросмотр на весь экран">
+          <div className="fullscreen-bar">
+            <span className="fullscreen-title">Предпросмотр статьи</span>
+            <button type="button" className="btn btn-small" onClick={() => setPreviewFull(false)}>
+              ✕ Закрыть (Esc)
+            </button>
+          </div>
+          <div className="fullscreen-body">
+            <MarkdownPreview content={contentMd} className="full" />
+          </div>
+        </div>
+      )}
+
       <div className="navbar">
         <div className="brand">
           <img src="/logo.png" alt="ЭВОЛЮЦИЯ" />
@@ -740,21 +789,18 @@ export default function Home() {
                 <div className="tabs">
                   <button className={`tab${editorTab === "write" ? " active" : ""}`} onClick={() => setEditorTab("write")}>Markdown</button>
                   <button className={`tab${editorTab === "preview" ? " active" : ""}`} onClick={() => setEditorTab("preview")}>Предпросмотр</button>
+                  <button
+                    type="button" className="btn btn-small tabs-fullscreen"
+                    onClick={() => setPreviewFull(true)}
+                    title="Открыть предпросмотр на весь экран"
+                  >
+                    ⛶ На весь экран
+                  </button>
                 </div>
                 {editorTab === "write" ? (
                   <textarea className="md-editor" value={contentMd} onChange={(e) => setContentMd(e.target.value)} />
                 ) : (
-                  <div className="markdown-preview">
-                    <ReactMarkdown
-                      remarkPlugins={[remarkGfm]}
-                      components={{
-                        img: ({ src, alt }) => <img src={src?.startsWith("/api/") ? `${API_BASE}${src}` : src} alt={alt} />,
-                        table: ({ children }) => <div className="table-scroll"><table>{children}</table></div>,
-                      }}
-                    >
-                      {contentMd}
-                    </ReactMarkdown>
-                  </div>
+                  <MarkdownPreview content={contentMd} />
                 )}
                 {failedImages.length > 0 && (
                   <div className="status error">

@@ -53,6 +53,7 @@ def _normalize_raw_markdown(raw: str) -> str:
     raw = SETEXT_H2_RE.sub(lambda m: f"## {m.group(1).strip()}", raw)
     raw = TRAILING_HARD_BREAK_RE.sub("", raw)
     raw = _unwrap_service_block_quote(raw)
+    raw = _convert_passport_html_table(raw)
     raw = _fix_empty_table_headers(raw)
     return raw
 
@@ -167,7 +168,13 @@ TABLE_SLUG_RE = _table_row_re("Slug")
 TABLE_SEO_TITLE_PASSPORT_RE = _table_row_re("SEO-title")
 TABLE_META_DESCRIPTION_PASSPORT_RE = _table_row_re("Meta description")
 TABLE_MAIN_QUERY_RE = _table_row_re("Главный запрос")
-TABLE_EXTRA_QUERIES_RE = _table_row_re("Дополнительные запросы")
+# Метка бывает с продолжением: "Дополнительные запросы — самые частотные",
+# "Дополнительные запросы — средне- и низкочастотные" и т.п. — таких строк
+# в паспорте может быть несколько, ключевые слова берём из всех.
+TABLE_EXTRA_QUERIES_RE = re.compile(
+    r"^\|\s*\*{0,2}Дополнительные запросы[^|\n]*?\*{0,2}\s*\|(.*)\|\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
 
 # Блок строк markdown pipe-таблицы, идущих подряд (без пустых строк между
 # ними) — используется, чтобы найти ГРАНИЦЫ целой таблицы "SEO-паспорт
@@ -202,9 +209,13 @@ _PLACEHOLDER_VALUE_RE = re.compile(r"^[-–—]+$")
 
 # В таблице "SEO-паспорт статьи" редакция часто дописывает в конце
 # значения SEO-title/Meta description длину в символах для контроля лимита
-# — например "...готовые шаблоны. (140)". Это заметка для автора, не часть
-# самого текста, и на сайте быть не должна.
-_CHAR_COUNT_SUFFIX_RE = re.compile(r"\s*\(\d{1,4}\)\s*$")
+# — например "...готовые шаблоны. (140)" или "(56 символов)", "(154 символа)",
+# "(58 симв.)", "(60 знаков)". Это заметка для автора, не часть самого
+# текста, и на сайте быть не должна.
+_CHAR_COUNT_SUFFIX_RE = re.compile(
+    r"\s*\(\s*\d{1,4}\s*(?:симв(?:ол(?:а|ов)?)?\.?|зн(?:ак(?:а|ов)?)?\.?)?\s*\)\s*$",
+    re.IGNORECASE,
+)
 
 
 def _strip_char_count_suffix(value: str) -> str:
@@ -238,6 +249,16 @@ def _extract_field(pattern: re.Pattern, text: str) -> str:
     return value
 
 
+_BR_TAG_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+
+
+def _br_to_separator(text: str) -> str:
+    """Перенос строки внутри ячейки (pandoc пишет его как <br />) —
+    это граница между ключевыми словами, а не часть слова: без замены
+    _strip_html склеил бы соседние запросы в одну строку."""
+    return _BR_TAG_RE.sub("; ", text)
+
+
 def _split_keyword_values(raw_value: str) -> list[str]:
     """Делит строку значения на отдельные ключевые слова. Разделитель
     варьируется между документами — встречается и запятая, и точка с
@@ -264,7 +285,7 @@ def _extract_keywords(full_text: str) -> list[str]:
     for pattern in KEYWORDS_PATTERNS:
         m = pattern.search(full_text)
         if m:
-            raw = _strip_html(m.group(1)).replace("**", "")
+            raw = _strip_html(_br_to_separator(m.group(1))).replace("**", "")
             kws = _split_keyword_values(raw)
             if kws:
                 return kws
@@ -277,9 +298,8 @@ def _extract_keywords(full_text: str) -> list[str]:
     main_query = _extract_field(TABLE_MAIN_QUERY_RE, full_text)
     if main_query:
         kws.append(main_query)
-    extra_match = TABLE_EXTRA_QUERIES_RE.search(full_text)
-    if extra_match:
-        raw_extra = _strip_html(extra_match.group(1)).replace("**", "")
+    for extra_match in TABLE_EXTRA_QUERIES_RE.finditer(full_text):
+        raw_extra = _strip_html(_br_to_separator(extra_match.group(1))).replace("**", "")
         kws.extend(_split_keyword_values(raw_extra))
     return _dedupe_keep_order(kws)
 
@@ -338,6 +358,17 @@ def _clean_title_text(text: str) -> str:
     return text.replace("**", "").strip()
 
 
+# Жирный абзац целиком, возможно с переносом строки внутри (Shift+Enter в
+# Word даёт в markdown перенос внутри абзаца — обычный "." его не пересекает).
+_BOLD_BLOCK_RE = re.compile(r"^\*\*(.+?)\*\*\s*$", re.DOTALL)
+
+
+def _match_bold_block(block: str) -> re.Match | None:
+    m = _BOLD_BLOCK_RE.match(block.strip())
+    # "**a** текст **b**" — не один жирный абзац, а смесь
+    return m if m and "**" not in m.group(1) else None
+
+
 def _strip_duplicate_title_paragraphs(rest: str, title: str) -> str:
     """Некоторые документы не используют markdown H1 для заголовка статьи
     вообще — название написано просто жирным абзацем (иногда разбитым на
@@ -352,7 +383,7 @@ def _strip_duplicate_title_paragraphs(rest: str, title: str) -> str:
     blocks = re.split(r"\n\s*\n", rest.strip())
     collected: list[str] = []
     for consumed, block in enumerate(blocks[:2], start=1):
-        bold = BOLD_ONLY_LINE_RE.match(block.strip())
+        bold = _match_bold_block(block)
         if not bold:
             break
         collected.append(_strip_html(bold.group(1)))
@@ -629,8 +660,9 @@ _RAW_HTML_TABLE_RE = re.compile(r"<table\b.*?</table>", re.IGNORECASE | re.DOTAL
 
 
 class _HTMLTableParser(HTMLParser):
-    def __init__(self):
+    def __init__(self, br_separator: str = " "):
         super().__init__(convert_charrefs=True)
+        self._br_separator = br_separator
         self.rows: list[list[str]] = []
         self.header_row_count = 0
         self._in_thead = False
@@ -652,7 +684,7 @@ class _HTMLTableParser(HTMLParser):
             self._in_cell = True
             self._current_cell_parts = []
         elif tag in ("br", "p") and self._in_cell and self._current_cell_parts:
-            self._current_cell_parts.append(" ")
+            self._current_cell_parts.append(self._br_separator)
 
     def handle_endtag(self, tag):
         tag = tag.lower()
@@ -749,6 +781,35 @@ def _convert_raw_html_tables(content: str) -> str:
     return _RAW_HTML_TABLE_RE.sub(_replace, content)
 
 
+# Таблица "SEO-паспорт" иногда приходит от pandoc не markdown-таблицей, а
+# сырым HTML <table> (так бывает, когда у ячеек заданы выравнивание, ширина
+# колонок и т.п.). Все паттерны полей выше рассчитаны на строки "| метка |
+# значение |", поэтому без конвертации значения вылавливаются из середины
+# HTML-тегов (в SEO-title попадает мусор вроде 'left;">...'), а ключевые
+# слова не находятся вовсе. Находим HTML-таблицу по ячейке с меткой "H1" и
+# превращаем в обычную pipe-таблицу; переносы строк в ячейках (<br>, <p>)
+# становятся разделителем "; " — так списки запросов остаются списками.
+_PASSPORT_H1_CELL_RE = re.compile(
+    r"<t[dh]\b[^>]*>\s*(?:<[^>]+>\s*)*H1\s*(?:</[^>]+>\s*)*</t[dh]>", re.IGNORECASE
+)
+
+
+def _convert_passport_html_table(raw: str) -> str:
+    def _replace(m: re.Match) -> str:
+        block = m.group(0)
+        if not _PASSPORT_H1_CELL_RE.search(block):
+            return block
+        parser = _HTMLTableParser(br_separator="; ")
+        try:
+            parser.feed(block)
+        except Exception:
+            return block
+        md_table = _rows_to_markdown_table(parser.rows, parser.header_row_count)
+        return md_table if md_table else block
+
+    return _RAW_HTML_TABLE_RE.sub(_replace, raw)
+
+
 @dataclass
 class ParsedArticle:
     title: str = ""
@@ -796,27 +857,26 @@ def parse_article(docx_path: str, media_dir: Path, known_title: str = "") -> Par
     # ошибки не допускает, поэтому должен проверяться раньше.
     seo_title = (
         _strip_char_count_suffix(_extract_field(TABLE_SEO_TITLE_PASSPORT_RE, raw))
-        or _extract_field(SEO_TITLE_RE, raw)
-        or _extract_field(TABLE_SEO_TITLE_RE, raw)
+        or _strip_char_count_suffix(_extract_field(SEO_TITLE_RE, raw))
+        or _strip_char_count_suffix(_extract_field(TABLE_SEO_TITLE_RE, raw))
         or title
     )
     meta_description = (
         _strip_char_count_suffix(_extract_field(TABLE_META_DESCRIPTION_PASSPORT_RE, raw))
-        or _extract_field(META_DESCRIPTION_RE, raw)
-        or _extract_field(TABLE_META_DESCRIPTION_RE, raw)
+        or _strip_char_count_suffix(_extract_field(META_DESCRIPTION_RE, raw))
+        or _strip_char_count_suffix(_extract_field(TABLE_META_DESCRIPTION_RE, raw))
     )
     keywords = _extract_keywords(raw)
-    # "SEO-паспорт статьи" иногда прямо даёт готовый чистый slug — если он
-    # есть, используем его вместо автогенерации из заголовка (но всё равно
-    # прогоняем через slugify_ru, чтобы гарантировать валидный kebab-case
-    # даже если редактор вписал его с пробелами/кириллицей).
-    slug_field = _extract_field(TABLE_SLUG_RE, raw)
+    # Slug строим из названия (SEO-title, а если его нет — заголовка), ровно
+    # так же, как кнопка ↻ в интерфейсе. Поле "Slug" из SEO-паспорта
+    # намеренно не используем: там обычно короткий вариант из пары слов,
+    # а на сайте нужен slug по полному названию.
 
     return ParsedArticle(
         title=title,
         seo_title=seo_title,
         meta_description=meta_description,
-        slug=slugify_ru(slug_field or seo_title or title),
+        slug=slugify_ru(seo_title or title),
         keywords=keywords,
         content_md=body.strip(),
         images=images,
