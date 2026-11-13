@@ -233,6 +233,7 @@ export default function Home() {
 
   // --- превью-картинка ---
   const [firstImageToken, setFirstImageToken] = useState(null);
+  const [coverImageNumber, setCoverImageNumber] = useState("1"); // номер картинки статьи для превью (строкой — пока человек печатает)
   const [coverSource, setCoverSource] = useState("first_article_image"); // 'first_article_image' | 'upload'
   const [coverUploadBase64, setCoverUploadBase64] = useState(null);
   const [coverUploadPreview, setCoverUploadPreview] = useState(null);
@@ -412,6 +413,7 @@ export default function Home() {
     setImagesFound(data.images_found || 0);
     setImageStatus(data.image_status || []);
     setFirstImageToken(data.first_image_token || null);
+    setCoverImageNumber("1");
     setCoverSource(data.first_image_token ? "first_article_image" : "none");
     setCoverUploadBase64(null);
     setCoverUploadPreview(null);
@@ -479,8 +481,11 @@ export default function Home() {
       const body = { title, subject };
       if (coverSource === "upload" && coverUploadBase64) {
         body.source_image_base64 = coverUploadBase64;
-      } else if (coverSource === "first_article_image" && firstImageToken) {
-        body.source_token = firstImageToken;
+      } else if (coverSource === "first_article_image") {
+        if (!coverImageToken) {
+          throw new Error(`Картинка №${coverNum} не загрузилась из документа — выберите другой номер или другой источник фото.`);
+        }
+        body.source_token = coverImageToken;
       }
       const res = await fetch(`${API_BASE}/api/generate-preview`, {
         method: "POST",
@@ -496,6 +501,28 @@ export default function Home() {
       setPreviewError(e.message);
     } finally {
       setGenerating(false);
+    }
+  }
+
+  async function handleDownloadPreview() {
+    if (!previewUrl) return;
+    setPreviewError("");
+    try {
+      // бэкенд на другом адресе, поэтому <a download> с прямой ссылкой не сработает —
+      // забираем файл и отдаём браузеру как локальный blob
+      const res = await fetch(previewUrl);
+      if (!res.ok) throw new Error(`Сервер вернул ${res.status}`);
+      const blob = await res.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = `${slug || "preview"}-preview.png`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    } catch (e) {
+      setPreviewError("Не удалось скачать превью: " + e.message);
     }
   }
 
@@ -584,6 +611,13 @@ export default function Home() {
 
   const canPublish = !!title && !!contentMd && !publishing;
   const failedImages = imageStatus.filter((s) => s.status === "error");
+
+  // Номер картинки статьи для превью: 1..N, где N — сколько картинок нашлось
+  // в самом документе (порядок такой же, как в тексте статьи).
+  const maxCoverImages = imageStatus.length;
+  const coverNum = Math.min(Math.max(parseInt(coverImageNumber, 10) || 1, 1), Math.max(maxCoverImages, 1));
+  const coverImage = imageStatus[coverNum - 1] || null;
+  const coverImageToken = coverImage?.status === "ok" ? coverImage.preview_url.split("/").pop() : null;
 
   return (
     <>
@@ -852,8 +886,27 @@ export default function Home() {
                       disabled={!firstImageToken}
                       onChange={() => setCoverSource("first_article_image")}
                     />
-                    <span>Первое фото из статьи{!firstImageToken && " (нет фото)"}</span>
+                    <span>Фото из статьи №</span>
+                    <input
+                      type="number" className="cover-number"
+                      min={1} max={Math.max(maxCoverImages, 1)}
+                      value={coverImageNumber}
+                      disabled={!firstImageToken}
+                      onChange={(e) => { setCoverImageNumber(e.target.value); setCoverSource("first_article_image"); }}
+                      onBlur={() => setCoverImageNumber(String(coverNum))}
+                      aria-label="Номер картинки из статьи"
+                    />
+                    <span className="hint-inline">{firstImageToken ? `из ${maxCoverImages}` : "(нет фото)"}</span>
                   </div>
+                  {coverSource === "first_article_image" && coverImage?.status === "ok" && (
+                    <img
+                      className="cover-thumb" alt={`Картинка ${coverNum} из статьи`}
+                      src={`${API_BASE}${coverImage.preview_url}`}
+                    />
+                  )}
+                  {coverSource === "first_article_image" && coverImage?.status === "error" && (
+                    <div className="status error">Картинка №{coverNum} не загрузилась из документа — выберите другой номер.</div>
+                  )}
                   <div className="checkbox-row">
                     <input type="radio" checked={coverSource === "upload"} onChange={() => setCoverSource("upload")} />
                     <span>Загрузить своё фото</span>
@@ -870,9 +923,16 @@ export default function Home() {
                   <label>Что на фото (необязательно, для точности)</label>
                   <input type="text" placeholder="например: перчатки диэлектрические на складе" value={subject} onChange={(e) => setSubject(e.target.value)} />
                 </div>
-                <button className="btn btn-primary" disabled={generating} onClick={handleGeneratePreview}>
-                  {generating ? "Генерирую…" : previewToken ? "Перегенерировать" : "Сгенерировать превью"}
-                </button>
+                <div className="actions">
+                  <button className="btn btn-primary" disabled={generating} onClick={handleGeneratePreview}>
+                    {generating ? "Генерирую…" : previewToken ? "Перегенерировать" : "Сгенерировать превью"}
+                  </button>
+                  {previewUrl && (
+                    <button type="button" className="btn" disabled={generating} onClick={handleDownloadPreview}>
+                      ⬇ Скачать превью
+                    </button>
+                  )}
+                </div>
                 {generating && <ProgressBar />}
                 {previewError && <div className="status error">{previewError}</div>}
                 {previewUrl && (

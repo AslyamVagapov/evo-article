@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 from openai import OpenAI
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 TARGET_SIZE = (1920, 1080)
 GENERATION_SIZE = "1536x1024"  # ближайший поддерживаемый размер по пропорциям, докадрируется до TARGET_SIZE
@@ -12,6 +12,26 @@ GENERATION_SIZE = "1536x1024"  # ближайший поддерживаемый
 LOGO_PATH = Path(__file__).parent / "logo.png"  # белый леттеринг "ЭВОЛЮЦИЯ" на прозрачном фоне
 LOGO_TARGET_WIDTH = 300   # px при холсте 1920 шириной
 LOGO_MARGIN = 46          # отступ от края холста, px
+
+# Заголовок рисуется кодом уже на готовом холсте 1920x1080. Генеративная
+# модель хорошо создаёт фон и фотографию, но не гарантирует, что длинный
+# русский текст будет дописан без ошибок и обрезки.
+TITLE_LEFT = 70
+TITLE_RIGHT = 900  # безопаснее диагональной границы даже в нижней части
+TITLE_TOP = 285
+TITLE_BOTTOM = 930
+TITLE_COLOR = (255, 255, 255, 255)
+
+FONT_BOLD_CANDIDATES = (
+    # Docker (пакет fonts-dejavu-core)
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    # Windows, локальная разработка
+    "C:/Windows/Fonts/arialbd.ttf",
+)
+FONT_REGULAR_CANDIDATES = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+)
 
 DEFAULT_MODEL = "gpt-image-2"
 
@@ -34,53 +54,15 @@ PROMPT_TEMPLATE = (
     "теме статьи: {subject}, резкое, с хорошим освещением, кадр немного "
     "крупным планом, фон нейтральный или соответствующий рабочей обстановке "
     "(склад, мастерская, производство, стройка — по смыслу темы), фото "
-    "визуально \"заходит\" в кадр из-под диагонального среза, без рамок."
-    "{title_block}"
+    "визуально \"заходит\" в кадр из-под диагонального среза, без рамок. "
+    "Синюю панель оставь полностью пустой: заголовок будет наложен кодом "
+    "после генерации. Не рисуй на ней буквы, слова, цифры или имитацию текста."
     " В верхнем левом углу синей панели оставь свободное, визуально спокойное "
     "пространство без текста и без собственных логотипов размером примерно "
     "15% ширины и 12% высоты кадра — туда отдельно наложится фирменный "
     "логотип. Никаких других надписей, вотермарок или логотипов на "
-    "картинке быть не должно."
-)
-
-# Двухъярусный заголовок, когда SEO-title содержит двоеточие (например
-# "Руки под защитой: всё о защитных перчатках") — основная часть крупным
-# жирным шрифтом, продолжение чуть меньшим и не таким жирным, оба белые,
-# в левой части синей панели, без подложек/табличек — просто текст на
-# сплошном синем фоне, как в образцах.
-TITLE_BLOCK_TWO_TIER = (
-    " На синей панели, в левой части, чуть ниже свободного места под "
-    "логотип — заголовок в две строчные группы, обе белым цветом, шрифт "
-    "крупный жирный без засечек, текст выровнен по левому краю: первая, "
-    "более крупная и жирная — «{title_main}»; сразу под ней, чуть меньшим "
-    "и менее жирным начертанием того же шрифта — «{title_sub}»."
-    "{fill_hint}"
-)
-TITLE_BLOCK_SINGLE_TIER = (
-    " На синей панели, в левой части, чуть ниже свободного места под "
-    "логотип — заголовок белым цветом, крупный жирный шрифт без засечек, "
-    "выровнен по левому краю, при необходимости в 2-3 строки: «{title_main}»."
-    "{fill_hint}"
-)
-
-# Модель генерации то оставляет большой пустой отступ снизу панели (текст
-# короткий, кегль маленький), то наоборот — при слишком крупном кегле текст
-# уходит вниз и обрезается краем кадра. Первое требование строго важнее
-# второго: сначала гарантируем, что ВЕСЬ текст целиком помещается внутри
-# панели и виден, и только при этом условии — заполняем кеглем свободное
-# место, а не наоборот.
-FILL_HINT = (
-    " Главное условие по заголовку — он должен ПОЛНОСТЬЮ помещаться внутри "
-    "синей панели: ни одна буква, ни одна строка не должна обрезаться, "
-    "выходить за нижний, левый или диагональный край панели или наезжать на "
-    "правую фотографическую часть кадра. Сначала прикинь, сколько строк "
-    "получится с учётом длины текста и переносов, и только исходя из этого "
-    "выбирай кегль шрифта — если строк много или текст длинный, сделай "
-    "кегль заметно меньше, чтобы всё гарантированно уместилось с отступом "
-    "снизу от края панели; если текст короткий — можно увеличить кегль, но "
-    "не настолько, чтобы текст полез вниз за пределы панели. Между "
-    "заполнением пространства и полной видимостью текста — видимость "
-    "важнее: лучше умеренный отступ снизу, чем обрезанный текст."
+    "картинке быть не должно. Вообще не добавляй никакой текст ни в одну "
+    "часть изображения."
 )
 
 
@@ -114,26 +96,24 @@ def _split_title(title: str) -> tuple[str, str]:
 
 
 def build_prompt(title: str, subject: str = "", has_reference: bool = False, has_source: bool = False) -> str:
-    subject = subject or "товар или сюжет по теме статьи"
-    title_main, title_sub = _split_title(title)
-    title_block = (
-        TITLE_BLOCK_TWO_TIER.format(title_main=title_main, title_sub=title_sub, fill_hint=FILL_HINT)
-        if title_sub
-        else TITLE_BLOCK_SINGLE_TIER.format(title_main=title_main, fill_hint=FILL_HINT)
-    )
-    prompt = PROMPT_TEMPLATE.format(subject=subject, title_block=title_block)
+    # Заголовок передаётся только как смысловая подсказка для выбора сюжета.
+    # Сам текст модель не рисует — это детерминированно делает Pillow.
+    subject = subject or title or "товар или сюжет по теме статьи"
+    prompt = PROMPT_TEMPLATE.format(subject=subject)
 
     if has_reference and has_source:
         prompt += (
             " Первое приложенное изображение — образец фирменного стиля превью: "
-            "повтори точно такую же диагональ, цвет панели и расположение текста. "
+            "повтори такую же диагональ, цвет панели и композицию, но полностью "
+            "игнорируй и не копируй текст и логотип с образца. "
             "Второе приложенное изображение — реальный объект, который нужно "
             "показать в фотографической части кадра вместо объекта с образца."
         )
     elif has_reference:
         prompt += (
             " Приложенное изображение — образец фирменного стиля превью: "
-            "повтори точно такую же диагональ, цвет панели и расположение текста, "
+            "повтори такую же диагональ, цвет панели и композицию, полностью "
+            "игнорируя текст и логотип с образца, "
             "но с другим объектом в кадре согласно описанию выше."
         )
     return prompt
@@ -144,6 +124,155 @@ def _fit_to_target(image_bytes: bytes) -> bytes:
     fitted = ImageOps.fit(img, TARGET_SIZE, method=Image.LANCZOS)
     out = io.BytesIO()
     fitted.save(out, format="PNG")
+    return out.getvalue()
+
+
+def _load_title_font(size: int, *, bold: bool) -> ImageFont.FreeTypeFont:
+    env_name = "PREVIEW_FONT_BOLD" if bold else "PREVIEW_FONT_REGULAR"
+    candidates = (os.getenv(env_name, ""),) + (
+        FONT_BOLD_CANDIDATES if bold else FONT_REGULAR_CANDIDATES
+    )
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return ImageFont.truetype(candidate, size=size)
+    raise ImageGenError(
+        "Не найден шрифт для заголовка превью. Установите fonts-dejavu-core "
+        f"или задайте путь в {env_name}."
+    )
+
+
+def _text_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont) -> int:
+    left, _, right, _ = draw.textbbox((0, 0), text, font=font)
+    return right - left
+
+
+def _split_long_word(draw: ImageDraw.ImageDraw, word: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
+    """Страховка для обозначений без пробелов, которые шире всей панели."""
+    parts: list[str] = []
+    current = ""
+    for char in word:
+        candidate = current + char
+        if current and _text_width(draw, candidate, font) > max_width:
+            parts.append(current)
+            current = char
+        else:
+            current = candidate
+    if current:
+        parts.append(current)
+    return parts
+
+
+def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
+    words: list[str] = []
+    for word in text.split():
+        if _text_width(draw, word, font) > max_width:
+            words.extend(_split_long_word(draw, word, font, max_width))
+        else:
+            words.append(word)
+
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = word if not current else f"{current} {word}"
+        if current and _text_width(draw, candidate, font) > max_width:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines or [""]
+
+
+def _line_height(font: ImageFont.FreeTypeFont, text: str) -> int:
+    """Общая кириллическая высота: строки имеют одинаковый шаг базовых линий."""
+    _, top, _, bottom = font.getbbox("АЙрущ", anchor="ls")
+    return bottom - top
+
+
+def _draw_title_line(draw, x, y, text, font):
+    # Одинаковая базовая линия независимо от наличия й, д, у в строке.
+    _, top, _, _ = font.getbbox("АЙрущ", anchor="ls")
+    left, _, _, _ = font.getbbox(text, anchor="ls")
+    draw.text((x - left, y - top), text, font=font, fill=TITLE_COLOR, anchor="ls")
+
+
+def _composite_title(image_bytes: bytes, title: str) -> bytes:
+    """Накладывает полный заголовок без участия генеративной модели.
+
+    Размер шрифта уменьшается до тех пор, пока все строки не войдут в
+    безопасную прямоугольную область слева от диагональной границы.
+    """
+    base = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+    draw = ImageDraw.Draw(base)
+    main, sub = _split_title(title)
+    max_width = TITLE_RIGHT - TITLE_LEFT
+    max_height = TITLE_BOTTOM - TITLE_TOP
+
+    layout = None
+    # Одну строку предпочитаем только при читаемом кегле. Длинную первую
+    # часть переносим по словам, прежде чем уменьшать её до мелкого текста.
+    layout_passes = ((1, 76), (5, 32)) if sub else ((6, 32),)
+    for max_main_lines, min_main_size in layout_passes:
+        for main_size in range(144, min_main_size - 1, -2):
+            sub_size = 120
+            main_font = _load_title_font(main_size, bold=True)
+            if any(_text_width(draw, word, main_font) > max_width for word in main.split()):
+                continue
+            main_lines = _wrap_text(draw, main, main_font, max_width)
+            if len(main_lines) > max_main_lines:
+                continue
+            main_spacing = max(8, round(main_size * 0.16))
+            group_gap = max(24, round(main_size * 0.32)) if sub else 0
+            main_height = sum(_line_height(main_font, line) for line in main_lines) + (len(main_lines) - 1) * main_spacing
+            # Продолжение подбирается независимо от длины номера ГОСТ.
+            # Проверяем реальные размеры строк и занимаем доступную высоту.
+            # В многострочном заголовке продолжение не должно подавлять
+            # основную тему (например огромным одиночным «требования»).
+            max_sub_size = min(120, main_size) if len(main_lines) > 1 else 120
+            for sub_size in range(max_sub_size, 23, -2):
+                sub_font = _load_title_font(sub_size, bold=False)
+                # Не разрываем длинное слово ради крупного кегля.
+                if any(_text_width(draw, word, sub_font) > max_width for word in sub.split()):
+                    continue
+                sub_lines = _wrap_text(draw, sub, sub_font, max_width) if sub else []
+                sub_spacing = max(4, round(sub_size * 0.05))
+                sub_height = sum(_line_height(sub_font, line) for line in sub_lines) + max(0, len(sub_lines) - 1) * sub_spacing
+                if main_height + group_gap + sub_height <= max_height:
+                    break
+            else:
+                continue
+            total_height = main_height + group_gap + sub_height
+            if total_height <= max_height:
+                layout = (
+                    main_font, sub_font, main_lines, sub_lines,
+                    main_spacing, sub_spacing, group_gap, total_height,
+                )
+                break
+        if layout is not None:
+            break
+
+    if layout is None:
+        raise ImageGenError("Заголовок слишком длинный для области превью")
+
+    (
+        main_font, sub_font, main_lines, sub_lines,
+        main_spacing, sub_spacing, group_gap, total_height,
+    ) = layout
+    y = TITLE_TOP + max(0, (max_height - total_height) // 2)
+
+    for line in main_lines:
+        _draw_title_line(draw, TITLE_LEFT, y, line, main_font)
+        y += _line_height(main_font, line) + main_spacing
+    if main_lines:
+        y -= main_spacing
+    y += group_gap
+    for line in sub_lines:
+        _draw_title_line(draw, TITLE_LEFT, y, line, sub_font)
+        y += _line_height(sub_font, line) + sub_spacing
+
+    out = io.BytesIO()
+    base.convert("RGB").save(out, format="PNG")
     return out.getvalue()
 
 
@@ -219,4 +348,5 @@ def generate_preview(
 
     raw_bytes = base64.b64decode(result.data[0].b64_json)
     fitted = _fit_to_target(raw_bytes)
-    return _composite_logo(fitted)
+    with_title = _composite_title(fitted, title)
+    return _composite_logo(with_title)

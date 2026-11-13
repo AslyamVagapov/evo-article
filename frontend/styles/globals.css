@@ -190,6 +190,25 @@ input[type="text"]:focus, input[type="date"]:focus, input[type="datetime-local"]
 .btn-primary:hover:not(:disabled) { background: var(--brand-dark); }
 .btn-small { padding: 6px 12px; font-size: 12.5px; }
 
+/* ---------- Номер картинки статьи для превью ---------- */
+.cover-number {
+  width: 72px; padding: 6px 8px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-family: var(--font-body); font-size: 14px;
+  color: var(--ink-900);
+}
+.cover-number:focus { outline: none; border-color: var(--brand); background: var(--white); }
+.cover-number:disabled { opacity: 0.5; }
+.hint-inline { font-size: 12.5px; color: var(--ink-500); }
+.cover-thumb {
+  display: block;
+  max-width: 220px; max-height: 130px; object-fit: cover;
+  margin: 0 0 10px 28px;
+  border: 1px solid var(--border); border-radius: 4px;
+}
+
 .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 9px; }
 .chip {
   display: inline-flex; align-items: center; gap: 6px;

@@ -47,12 +47,20 @@ def _strip_html(text: str) -> str:
     return _HTML_TAG_RE.sub("", text)
 
 
+# Выделение текста маркером/цветом в Word pandoc отдаёт как сырой HTML
+# <span class="mark">...</span> (бывают и другие class/style). Фронтенд и сайт
+# такие теги не разбирают, а показывают буквально, поэтому убираем сами
+# теги, оставляя текст внутри.
+_SPAN_TAG_RE = re.compile(r"</?span\b[^>]*>", re.IGNORECASE)
+
+
 def _normalize_raw_markdown(raw: str) -> str:
     raw = raw.replace("\r\n", "\n").replace("\r", "\n")
     raw = SETEXT_H1_RE.sub(lambda m: f"# {m.group(1).strip()}", raw)
     raw = SETEXT_H2_RE.sub(lambda m: f"## {m.group(1).strip()}", raw)
     raw = TRAILING_HARD_BREAK_RE.sub("", raw)
     raw = _unwrap_service_block_quote(raw)
+    raw = _SPAN_TAG_RE.sub("", raw)
     raw = _convert_passport_html_table(raw)
     raw = _fix_empty_table_headers(raw)
     return raw
